@@ -1,0 +1,473 @@
+#!/bin/bash
+
+kpref="#"
+refs="%"
+
+# ref count is a literal starting with a comment char #
+# in the form: # <(N)>, where N gets incremented
+# 
+conffile_get_itemcount() {
+  local file="$1"  ; shift
+  local key="$1"   ; shift
+
+  local rkey="$kpref$key"
+  local skey="^$rkey"
+
+  local count="0"
+
+  # If there is already an entry,
+  # set the count at least to 1.
+  grep -q "^$key" "$file" &> /dev/null && count=1
+
+  # If there already is a counter,
+  # the set the count accordingly.
+  if grep -q "$skey" "$file"  &> /dev/null ; then
+    # ok entry already existent, increment refcount
+    local val=$(sed -n "\|$skey|p" "$file" | cut -d"$refs" -s -f2 | cut -d'(' -f2 | cut -d')' -f1)
+
+    [ -n "$val" ] && count="$val"
+  fi
+
+  echo "$count"
+}
+
+conffile_set_itemcount() {
+  local file="$1"  ; shift
+  local key="$1"   ; shift
+  local arg="$1"   ; shift
+  local count="$1" ; shift
+
+  local rkey="$kpref$key"
+  local skey="^$rkey"
+
+  # Remove the counter and the entry.
+  sed "\|$skey|d" "$file" | sed "\|^$key|d" > "$file.tmp"
+
+  if [ $count -gt 0 ] ; then
+    # Re-add them now cleanly.
+
+    # If the count is more than one, we need to remember it.
+    [ $count -gt 1 ] && echo "$rkey $refs <($count)>" >> "$file.tmp"
+
+    echo "$key $arg"              >> "$file.tmp"
+  fi
+
+  # ... and apply.
+  mv "$file.tmp" "$file"
+}
+
+conffile_get_itemvalue() {
+  local file="$1"  ; shift
+  local key="$1"   ; shift
+
+  local arg=""
+  local entry=""
+  # Let's see if there is an entry.
+  if entry=$(grep "^$key" "$file") ; then
+    arg=${entry##$key}
+    arg=${arg# }
+  fi
+
+  echo "$arg"
+}
+
+conffile_add_item() {
+  local file="$1"  ; shift
+  local key="$1"   ; shift
+  local arg="$1"   ; shift
+
+  local count=$(conffile_get_itemcount "$file" "$key")
+
+  count=$((count+1))
+
+  conffile_set_itemcount "$file" "$key" "$arg" "$count"
+}
+
+conffile_rem_item() {
+  local file="$1" ; shift
+  local key="$1"  ; shift
+
+  local count=$(conffile_get_itemcount "$file" "$key")
+  
+  count=$((count-1))
+
+  local arg=""
+  [ $count -gt 0 ] && arg=$(conffile_get_itemvalue "$file" "$key")
+
+  conffile_set_itemcount "$file" "$key" "$arg" "$count"
+}
+
+
+# Initramfs
+initramfs_add_module() {
+  local module="$1"
+
+  conffile_add_item /etc/initramfs-tools/modules $module ""
+
+  # Update initramfs.
+  update-initramfs -u
+}
+
+initramfs_rem_module() {
+  local module="$1"
+
+  conffile_rem_item /etc/initramfs-tools/modules $module
+
+  # Update initramfs.
+  update-initramfs -u
+}
+
+
+# Mount stuff
+mounts_add() {
+  local device="$1" ;  shift
+  local mpoint="$1" ;  shift
+  local fstype="$1" ;  shift
+  local optins="$1" ;  shift
+  local dump="$1"   ;  shift
+  local check="$1"  ;  shift
+ 
+  conffile_add_item /etc/fstab "$device"  "$mpoint $fstype $optins $dump $check"
+
+  # FIXME: This shouldn't be needed -> do init scripts.
+	if [ ! -x /usr/sbin/policy-rc.d ] || /usr/sbin/policy-rc.d ; then
+    [ $(conffile_get_itemcount /etc/fstab "$device") -eq 1 ] && mount "$mpoint"
+  fi
+
+  return 0
+}
+
+mounts_rem() {
+  local device="$1" ;  shift
+
+  # FIXME: This shouldn't be needed -> do init scripts.
+	if [ ! -x /usr/sbin/policy-rc.d ] || /usr/sbin/policy-rc.d ; then
+    [ $(conffile_get_itemcount /etc/fstab "$device") -eq 1 ] && umount "$device"
+  fi
+
+  conffile_rem_item /etc/fstab "$device"
+}
+
+
+# Mount helper functions.
+# Find the mount point and type of particular file.
+mp_dump() {
+  echo Mount Point is: 
+  echo theDir x"$theDir"x
+  echo path x"$mp_path"x
+  echo type x"$mp_type"x
+  echo root x"$mp_root"x
+  echo relpath x"$mp_relpath"x
+  echo all x"$mp_root$mp_relpath"x
+}
+
+mp_find_proc() {
+  theDir=$1
+  theDir=$(readlink -f $theDir)
+
+  mp_relpath="/"
+  mp_path=""
+  mp_type=""
+  mp_root=""
+
+  local tmp="$theDir"
+
+  while [ "x$mp_path" = "x" ] ; do
+    mp_path=$(sort /proc/mounts|uniq|awk -v part=$tmp '{ if (part == $2 && $1 != "rootfs" ) print $2 }')
+    if [ "x$mp_path" != x ] ; then
+      mp_type=$(sort /proc/mounts|uniq|awk -v part=$tmp '{ if (part == $2 && $1 != "rootfs" ) print $3 }')
+      mp_root=$(sort /proc/mounts|uniq|awk -v part=$tmp '{ if (part == $2 && $1 != "rootfs" ) print $1 }')
+
+    else
+      ttt="$tmp"
+      tmp="${tmp%/*}"
+
+      mp_relpath="${ttt:${#tmp}}$mp_relpath"
+
+      [ x$tmp == "x" ] && tmp="/"
+    fi
+  done
+}
+
+mp_find_mtab() {
+  theDir=$1
+  theDir=$(readlink -f $theDir)
+
+  mp_relpath="/"
+  local tmp="$theDir"
+  mp_path=""
+  mp_type=""
+  mp_root=""
+
+  while [ "x$mp_path" = "x" ] ; do
+    mp_path=$(mount|sort|uniq|awk -v part=$tmp '{ if (part == $3 && $5 != "rootfs" ) print $3 }')
+    if [ "x$mp_path" != x ] ; then
+      mp_type=$(mount|sort|uniq|awk -v part=$tmp '{ if (part == $3 && $5 != "rootfs" ) print $5 }')
+      mp_root=$(mount|sort|uniq|awk -v part=$tmp '{ if (part == $3 && $5 != "rootfs" ) print $1 }')
+
+      break
+    fi
+
+    if [ "$tmp" = "/" ] ; then
+      break
+    fi
+
+    ttt="$tmp"
+    tmp="${tmp%/*}"
+
+    mp_relpath="${ttt:${#tmp}}$mp_relpath"
+
+    [ x$tmp == "x" ] && tmp="/"
+  done
+}
+
+mp_find_help() {
+  xDir=$1
+  mp_find_mtab $xDir
+  ([ "$mp_type" = rootfs ] || [ ! "$mp_type" ] )&& mp_find_proc $xDir
+
+  return 0
+}
+
+mp_find() {
+  mp_find_help $1
+
+  while [ x"$mp_type" = xnone ] ; do
+    mp_find_help $mp_root$mp_relpath
+  done
+}
+
+volume_get_url() {
+  local volume=$1 ; shift
+
+  local host_ip=$(find_default_ip)
+
+  mp_find $volume
+
+  local url=""
+
+  # RFS server
+  if [[ $mp_type == nfs* ]] ; then
+    local host=${mp_root%%:*}
+    local path=${mp_root##*:}
+    url="nfs:$host$path$mp_relpath"
+  else
+    url="nfs:$host_ip$volume"
+  fi
+
+  echo $url
+}
+
+# URLs
+nfsurl_to_snet() {
+  local url=$1 ; shift
+
+  # Map NFS URLs to /net.
+  [ $(url_get_protocol $url) = nfs ] && url="file:///net/$(url_get_host $url)$(url_get_path $url)"
+
+  echo "$url"
+}
+
+nfsurl_to_nfs() {
+  local url=$1
+
+  if [ $(url_get_protocol $url) = nfs ] ; then
+    echo "$(url_get_host $url):$(url_get_path $url)"
+  else
+    return 1
+  fi
+}
+
+url_get_protocol() {
+  local url=$1 ; shift
+
+  local protocol=${url%%:*}
+
+  echo $protocol
+} 
+
+url_get_host() {
+  local url=$1 ; shift
+
+  local path=${url##*:}
+  local host=${path%%/*}
+
+  echo $host
+} 
+
+url_get_path() {
+  local url=$1 ; shift
+
+  local path=${url##*:}
+  path=/${path#*/}
+
+  echo $path
+} 
+
+url_set_host() {
+  local url=$1  ; shift
+  local nhost=$1 ; shift
+
+  local protocol=${url%%:*}
+  local path=${url##*:}
+  local host=${path%%/*}
+  path=/${path#*/}
+
+  echo "$protocol:$nhost$path"
+} 
+
+memtotal() {
+  memtotal=$(grep ^MemTotal: /proc/meminfo)
+  memtotal=${memtotal#*: }
+  measure=${memtotal##* }
+  memtotal=${memtotal% kB}
+
+  echo $memtotal
+}
+
+find_default_nic() {
+  local nic=$(/sbin/route -n  | awk '/^0.0.0.0 / { print $8 }')
+
+  # FIXME: Should use any interface which is "up".
+  if ! [ "$nic" ] ; then
+    nic=subnet0
+  fi
+
+  echo $nic
+}
+
+find_default_ip() {
+  local nic=$(find_default_nic)
+
+  local ip=""
+  [ -n "$nic" ] && ip=$(/sbin/ifconfig "$nic" 2> /dev/null | grep -w 'inet'| cut -d: -f2 | awk '{ print $1}')
+
+  echo $ip
+}
+
+
+find_a_bridge() {
+  local nic=$(find_default_nic)
+
+  local nics="$nic subnet0"
+
+  # Try some nics to bridges.
+  for nic in $nics ; do
+    if /usr/sbin/brctl show | grep "^$nic" > /dev/null ; then
+      echo $nic
+      break
+    fi
+  done
+}
+
+nic_set() {
+  local    name=$1 ; shift
+  local    mode=$1 ; shift
+  local address=$1 ; shift
+  local netmask=$1 ; shift
+  local    auto=$1 ; shift
+
+  local broadcast=""
+  local    preups=""  
+  local   postups=""  
+  local  predowns=""  
+  local postdowns=""  
+  while [ $# -gt 1 ] ; do
+    local arg=$1
+
+    case $arg in
+    "pre-up")
+      preups="$preups \"preup=$2\""
+      shift 2
+      ;;
+
+    "post-up")
+      postups="$postups \"postup=$2\""
+      shift 2
+      ;;
+
+    "pre-down")
+      predowns="$predowns \"predown=$2\""
+      shift 2
+      ;;
+
+    "post-down")
+      postdowns="$postdowns \"postdown=$2\""
+      shift 2
+      ;;
+
+    "broadcast")
+      broadcast="\"broadcast=$2\""
+      shift 2
+      ;;
+
+    esac
+  done
+
+  local file=${1:-/etc/network/interfaces}
+  local nic_awk="$(dirname $bootnet_shl)/nic.awk"
+
+  mkdir -p $(basename $file)
+  args="\"name=$name\" \"mode=$mode\" \"address=$address\" \"netmask=$netmask\" \"auto=$auto\" $preups $postups $predowns $postdowns \"$broadcast\""
+  $(eval $nic_awk $args $file > $file.tmp)
+  mv $file.tmp $file
+
+  # FIXME: This shouldn't be needed -> do init scripts.
+	if [ ! -x /usr/sbin/policy-rc.d ] || /usr/sbin/policy-rc.d ; then
+    [ $auto ] && [ $file = /etc/network/interfaces ] && ifup $name
+  fi
+
+  return 0
+}
+
+nic_clear() {
+  local name=$1 ; shift
+  local file=${1:-/etc/network/interfaces}
+
+  # FIXME: This shouldn't be needed -> do init scripts.
+	if [ ! -x /usr/sbin/policy-rc.d ] || /usr/sbin/policy-rc.d ; then
+    [ $file = /etc/network/interfaces ] && ifdown $name
+  fi
+
+  nic_set $name "" "" "" "" "$file"
+}
+
+
+resolver_add_nameserver() {
+  local key=$1 ; shift
+  local ip=$1  ; shift  
+
+  echo "nameserver $ip" | /sbin/resolvconf -a "${key}_nms"
+}
+
+resolver_rem_nameserver() {
+  local key=$1 ; shift
+
+  /sbin/resolvconf -d "${key}_nms"
+}
+
+resolver_add_domain() {
+  local    key=$1 ; shift
+  local domain=$1 ; shift
+
+  echo "domain $domain" | /sbin/resolvconf -a "${key}_dmn"
+}
+
+resolver_rem_domain() {
+  local key=$1 ; shift
+
+  /sbin/resolvconf -d "${key}_dmn"
+}
+
+resolver_add_resolvconf() {
+  local    key=$1 ; shift
+  local source=$1 ; shift
+
+  cat "$source" | /sbin/resolvconf -a $key
+}
+
+resolver_rem_resolvconf() {
+  local key=$1 ; shift
+
+  /sbin/resolvconf -d $key
+}

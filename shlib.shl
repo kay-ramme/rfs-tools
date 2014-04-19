@@ -1,0 +1,304 @@
+#!/bin/bash -eu
+
+trap '[ $? != 0 ] && echo ERROR $0 -- $PARAS' EXIT
+PARAS="$@"
+
+
+shlib_load_with_path() {
+  local paths=$1 ; shift
+  local d
+  local x
+  local loaded=""
+
+  for d in $* ; do
+    cname=${d//-/_}_shl
+    cname=${cname//./_}
+    cname=${cname//\//_}
+
+    # Already loaded?
+    if [ $(eval 'echo ${'${cname}':-}') ] ; then
+     continue
+    fi
+
+    # Search for it.
+    for x in ${paths//:/ }; do
+      shl="$x/$d".shl
+
+      if [ -f "$shl" ] ; then
+        echo "shlib - loading library: $shl" >&2
+        eval "${cname}=$shl"
+        . "$shl"
+        loaded="1"
+        break
+      fi
+    done
+
+    if ! [ "$loaded" ] ; then
+      echo "shlib - couldn't find: $d" >&2
+      false
+    fi
+
+    loaded=""
+  done
+}
+
+shlib_load() {
+  if [ "$1" == "shlib" ] ; then
+    return
+  fi
+
+  shlib_load_with_path "$LIBSPATH" $*
+}
+
+build_to_repo() {
+  # TODO: This needs to be figured out automatically.
+  local site="bazult.de"
+  # TODO: This needs to be figured out automatically.
+  local stem="bootbox"
+  # TODO: This needs to be configured in the packages.
+  local components=base
+
+  local branch=$(git branch | grep ^\* | cut -d \  -f 2 | head -n 1)
+
+  # Build a repo somewhere.
+  aptrepo_add_distro $site $stem $branch $components
+
+  # Iterate over dirs, pack everything
+  # having a "control" file and add it to the repo.
+  local src_d
+  for src_d in $rootdir* ; do
+    if [ -d $src_d -a -e $src_d/control ] ; then
+      echo "  adding:" $src_d
+      aptrepo_add_source $src_d $stem $branch
+    fi
+  done
+}
+
+declare -A _pathes
+
+_pathes_add() {
+  local path=$1
+
+  _pathes[$path]="$path"
+}
+
+_pathes_from_var() {
+  local path=$1
+
+  _pathes=()
+
+  if [ ! "$path" ] ; then
+    return
+  fi
+
+  declare -a tpath
+  IFS=':' read -ra tpath <<< "$path"
+
+  local src_d
+  for src_d in ${tpath[@]} ; do
+    _pathes_add "$src_d"
+  done
+}
+
+_pathes_get_path() {
+  local src_d   
+  local path=""
+
+  if [ ${#_pathes[*]} -gt 0 ] ; then
+    for src_d in ${_pathes[@]} ; do
+      if [ "$path" ] ; then
+        path+=":$src_d"
+      else
+        path="$src_d"
+      fi
+    done
+
+    _pathes=()
+  fi
+
+  echo "$path"
+}
+
+# Extend the PYTHONPATH.
+set_pypath() {
+  PYTHONPATH=${PYTHONPATH-""}
+  _pathes_from_var "$PYTHONPATH"
+
+  if [ "$rootdir" == "/" ] ; then
+    _pathes_add "/usr/share/bootnet"
+  else
+    local src_d
+    for src_d in $rootdir* ; do
+      [ -d "$src_d/usr/share/pyshared" ] && _pathes_add "$src_d/usr/share/pyshared"
+
+      local module=$(echo $src_d/usr/share/*/__init__.py)
+      [ -f "$module" ] && _pathes_add "$src_d/usr/share"
+    done
+
+    export PYTHONDONTWRITEBYTECODE=1
+  fi
+
+  PYTHONPATH="$(_pathes_get_path)"
+  export PYTHONPATH
+  # Disable pre-compilation.
+}
+
+# Extend the bin PATH.
+set_binpath() {
+  PATH=${PATH-""}
+  _pathes_from_var "$PATH"
+
+  if [ "$rootdir" == "/" ] ; then
+    :
+  else
+    local src_d
+    for src_d in $rootdir* ; do
+      [ -d "$src_d/usr/bin" ] && _pathes_add "$src_d/usr/bin"
+    done
+  fi
+
+  PATH="$(_pathes_get_path)"
+  export PATH
+}
+
+# Extend the BOOTNETPATH.
+set_bnpath() {
+  BOOTNETPATH=${BOOTNETPATH-""}
+  _pathes_from_var "$BOOTNETPATH"
+   
+  if [ "$rootdir" == "/" ] ; then
+    _pathes_add "/usr/share/bootnet/plugins"
+  else
+    local src_d
+    for src_d in $rootdir* ; do
+      [ -d "$src_d/usr/share/bootnet/plugins" ] && _pathes_add "$src_d/usr/share/bootnet/plugins"
+    done
+  fi
+
+  BOOTNETPATH="$(_pathes_get_path)"
+  export BOOTNETPATH
+}
+
+# Extend the JavaScript path.
+set_jspath() {
+  JSPATH=${JSPATH-""}
+  _pathes_from_var "$JSPATH"
+
+  if [ "$rootdir" == "/" ] ; then
+    :
+  else
+    local src_d
+    for src_d in $rootdir* ; do
+      [ -d "$src_d/usr/share/javascript" ] && _pathes_add "$src_d/usr/share/javascript"
+    done
+  fi
+
+  JSPATH="$(_pathes_get_path)"
+  export JSPATH
+}
+
+# Extend the BNJSPATH.
+set_bnjspath() {
+  set_jspath
+
+  BNJSPATH=${BNJSPATH-""}
+  _pathes_from_var "$BNJSPATH"
+
+  if [ "$rootdir" == "/" ] ; then
+    :
+  else
+    local src_d
+    for src_d in ${JSPATH//:/ } ; do
+      if [ -d $src_d/bootnet ] ; then
+        pushd $rootdir > /dev/null
+        local dirs=$(find $src_d/bootnet -type d) 2> /dev/null
+        popd > /dev/null
+
+        local d
+        for d in $dirs ; do
+          _pathes_add "$d"
+        done
+
+        pushd $rootdir > /dev/null
+        local dirs=$(find $src_d/bootnet -name "*.js") 2> /dev/null
+        popd > /dev/null
+
+        local d
+        for d in $dirs ; do
+          _pathes_add "${d%.js}"
+        done
+      fi
+    done
+  fi
+
+  BNJSPATH="$(_pathes_get_path)"
+  export BNJSPATH
+}
+
+# Extend the LIBSPATH.
+set_libspath() {
+  LIBSPATH=${LIBSPATH-""}
+  _pathes_from_var "$LIBSPATH"
+
+  if [ "$rootdir" == "/" ] ; then
+    _pathes_add "/usr/share/bootnet/libs/"
+  else
+    local src_d
+    for src_d in $rootdir/* ; do
+      local l="$src_d/usr/share/bootnet/libs"
+      [ -d "$l" ] && _pathes_add "$l"
+    done
+  fi
+
+  LIBSPATH="$(_pathes_get_path)"
+  export LIBSPATH
+}
+
+
+invoke_lib() {
+  local library=$1 ; shift
+
+  shlib_load "$library"
+
+  local cmd=$1 ; shift
+
+  local args=""
+  for arg in "$@" ; do
+    args="$args \"$arg\""
+  done
+
+  eval $cmd $args
+}
+
+
+print_env() {
+  env
+}
+
+# Are we executed directly ?
+if [ "$(basename $0)" == "shlib.shl" ] ; then
+  rootdir="$(readlink -f $(dirname $0)/../../../../..)"
+fi
+
+rootdir=${rootdir:-/}
+
+if [ "$rootdir" != "/" ] ; then
+  rootdir="$rootdir/"
+fi
+
+export ROOTDIR="$rootdir"
+
+set_pypath   # Python paths, AKA PYTHONPATH
+set_binpath  # Binaries paths, AKA PATH
+set_bnpath   # Bootnet Python plug-in paths
+set_jspath   # JavaScript paths
+set_bnjspath # Bootnet JavaScript plug-in paths
+set_libspath # Shell script library paths
+
+if [ "$(basename $0)" == "shlib.shl" ] ; then
+  if [ "$1" == "/bin/bash" ] ; then
+    /bin/bash
+  else
+    invoke_lib $@
+  fi
+fi

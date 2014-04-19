@@ -1,0 +1,633 @@
+#!/bin/bash
+
+. /etc/environment
+
+shlib_load "bootnet" "bautofs" "apt-tools"
+
+rfs_tools_d=$(dirname ${rfs_tools_shl})
+
+get_plgpath() {
+  local plgpath
+
+#  if [ "$rootdir" == "/" ] ; then
+#    plgpath=${PLGPATH-/usr/share/rfs-tools/plg}
+#  else
+    # Extend the bin PATH.
+    plgpath=${PLGPATH-"."}
+#  fi
+
+  local src_d   
+  for src_d in $rootdir* ; do
+    path=$(echo "$src_d/usr/share/rfs-tools/plg")
+    if [ -d "$path" ] ; then
+      if [ "$plgpath" ] ; then
+        plgpath="$path:$plgpath"
+      else
+        plgpath="$path"
+      fi
+    fi
+  done
+
+  echo "$plgpath"
+}
+
+_rfs_create_script() {
+  local script=$(mktemp -p /tmp)
+
+  echo '#!/bin/bash -eu'     >  $script
+  echo "trap '[ \$? != 0 ] && echo ERROR \$0 -- \$@' EXIT" >> $script
+  echo 'rootdir="/"'         >> $script
+  echo 'shlib_load() {'      >> $script
+  echo '  local a;}'         >> $script
+
+  # Pass on any http_proxy.
+  [ ${http_proxy+x} ] && echo "export http_proxy=\"$http_proxy\""  >> $script
+
+  # "Link in" needed funs, strip includes.
+  cat "$bootnet_shl"   >> $script
+  cat "$apt_tools_shl" >> $script
+
+  if ! [ $chroot ] ; then
+    # FIXME: Shouldn't need to sleep.
+    echo 'sleep 10'              >> $script
+
+    grep -v '^\.' "$bautofs_shl" >> $script
+    echo "autofs_ensure"         >> $script
+  fi
+
+  echo $script
+}
+
+_rfs_execute_script() {
+  local script=$1 ; shift
+  local volume=$1 ; shift
+  local   arch=$1 ; shift
+  local    net=$1 ; shift
+  local chroot=$1 ; shift
+
+  chmod u+x $script
+
+  # Copy script to RFS.
+  rfs_cp $script $volume /root
+  rm $script
+
+  local keep_rfs_graphic=${RFS_GRAPHIC-""}
+  RFS_GRAPHIC=""
+
+  # WORKAROUND: for cups set dummy hostname
+  echo "bla" > "$volume/etc/hostname"
+  rfs_execute $volume "$arch" "$net" "$chroot" /root/$(basename $script)
+  rm "$volume/etc/hostname"
+
+  RFS_GRAPHIC="$keep_rfs_graphic"
+}
+
+rfs_install() {
+  local volume=${1%/}/ ; shift
+  local   arch=$1      ; shift
+  local    net=$1      ; shift
+  local chroot=$1      ; shift
+
+  local packages="$*"
+
+  local script=$(_rfs_create_script)
+
+  # Extract repos from packages and the repos.
+  local tpackages=""
+  local   package=""
+  local    mounts=""
+  for package in $packages ; do 
+    local aptdscp_f=${package%/*}
+
+    # Dot means relative.
+    # ? Maybe the git repo we are running in.
+    if [ $aptdscp_f == "." ] ; then
+      branch=$(git branch| grep '^*'|sed 's/\* //g')
+      aptdscp_f=$APTREPO_D/distros/bootbox-$branch.dscp
+    fi
+
+    local   object=${package##*/}
+
+    # Some code for adding the repo.
+    if [ -f $aptdscp_f ] ; then
+         url=$(aptdscp_get_url    $aptdscp_f)
+        stem=$(aptdscp_get_stem   $aptdscp_f)
+      branch=$(aptdscp_get_branch $aptdscp_f)
+        cmps=$(aptdscp_get_cmps   $aptdscp_f)
+         key=$(aptdscp_get_key    $aptdscp_f)
+
+      if [ $chroot ] && ( [ $(url_get_protocol $url) = file ] || [ $(url_get_protocol $url) = nfs ] ) ; then
+        local mpath=$(url_get_path $(nfsurl_to_snet $url))
+        local mpoint=${volume}$mpath
+
+        mkdir -p $mpoint
+        mount -o bind $mpath $mpoint
+        mount -o remount,ro  $mpoint
+
+        mounts="$mounts $mpoint"
+
+        # Need to rewrite NFS URL into file URL.
+        if [ $(url_get_protocol $url) = nfs ] ; then
+          url=$(nfsurl_to_snet $url)
+        fi
+      fi
+
+      # Repo is private, inherit keys from parent.    
+      if [ ${url:0:6} == "ssh://" ] ; then
+        echo "IMPORTANT NOTE: Inheriting source public AND private keys to target." >&2
+        rfs_cp /root/.ssh/id_rsa     $volume /root/.ssh/
+        rfs_cp /root/.ssh/id_rsa.pub $volume /root/.ssh/
+      fi
+
+      echo "apt_add_repo $url $stem $branch $cmps \"$key\"" >> $script
+
+      # FIXME: May need to export dir.
+    fi
+
+    tpackages="$tpackages $object"
+  done
+
+  packages=$tpackages
+  echo "apt_install_pkgs $packages"          >> $script
+
+  _rfs_execute_script "$script" "$volume" "$arch" "$net" "$chroot"
+
+  # Unmouting all mounts.
+  for mnt in $mounts ; do
+    umount $mnt >&2
+    # FIXME: Need to remove mpoints.
+  done
+}
+
+rfs_remove() {
+  local volume=${1%/}/ ; shift
+  local   arch=$1      ; shift
+  local    net=$1      ; shift
+  local chroot=$1      ; shift
+
+  local packages="$*"
+
+  local script=$(_rfs_create_script)
+
+  echo "apt_remove_pkgs $packages"          >> $script
+
+  _rfs_execute_script "$script" "$volume" "$arch" "$net" "$chroot"
+}
+
+#
+# Copy a file/directory into a RFS.
+# 
+# Usage:
+#  rfs_cp <file>|<dir>  <targetdir>
+#
+rfs_cp() {
+  local      file=$1      ; shift
+  local    volume=${1%/}/ ; shift
+  local targetdir=$1      ; shift
+
+  mkdir -p $volume$targetdir
+  rsync -a $file $volume$targetdir
+}
+
+
+# Generate a random mac address. FIXME: Not perfect, but works for now.
+gen_macadd() {
+  addr="52:54:00:12"
+  for i in 1 2 ; do 
+    addr="$addr$(echo ":$RANDOM" | cut -c -3)"
+  done
+
+  echo $addr
+}
+
+
+get_netopts_p() {
+  local    net=$1      ; shift
+  local   vlan=$1      ; shift
+  local volume=${1%/}/ ; shift
+
+  local con=""
+  local netopts=""
+
+  case "$net" in
+  "bridged" )
+    tap=$(basename $(mktemp -p /tmp tapXXXXX)) >& /dev/null
+    tunctl -t $tap  >& /dev/null
+    con="-net tap,vlan=$vlan,ifname=$tap,script=${rfs_tools_d}qemu-ifup,downscript=${rfs_tools_d}qemu-ifdown"
+    ;;
+
+  "private" )
+    con="-net socket,vlan=$vlan,mcast=230.0.0.1:1234"
+    ;;
+
+  "host" )
+    con=""
+    ;;
+
+  "user" )
+    con="-net user,vlan=$vlan"
+    ;;
+
+  * )
+    return 1
+    ;;
+  esac
+
+  netopts="-net nic,vlan=$vlan,macaddr=$(gen_macadd)"
+  ! [ -e "$volume"netboot ] && netopts="$netopts,model=virtio"
+  netopts="$netopts $con"
+ 
+  echo $netopts
+}
+
+system_setup_sshaccess() {
+  local user_dir="$1"
+  local file="$user_dir/.ssh/id_rsa"
+
+  mkdir "$(dirname $file)"
+
+  ssh-keygen -t rsa -N "" -f "$file"
+
+  cat "$file.pub" > ~/.ssh/authorized_keys
+}
+
+
+arch_to_emu() {
+  local arch=$1 ; shift
+
+  local emu=""
+
+  if [ $arch = $(uname -m) ] && /usr/sbin/kvm-ok >> /dev/null ; then
+      emu=/usr/bin/kvm
+ 
+  else
+    if [ $arch = i386 ] ; then
+      # Optimization - use kvm x86_64 also for i386, if possible.
+      if [ $(uname -m) = x86_64 ] && /usr/sbin/kvm-ok >> /dev/null ; then
+        emu=/usr/bin/kvm
+      else
+        emu=/usr/bin/qemu
+      fi
+    else
+      emu=/usr/bin/qemu-system-$arch
+    fi  
+  fi
+
+  echo $emu
+}
+
+
+rfs_execute_vm() {
+  local  volume=${1%/}/ ; shift
+  local    arch=$1      ; shift
+  local     net=$1      ; shift
+  local command=$1      ; shift
+
+  local eventdir="${volume}etc/init/"
+  local graphic=""
+  local console=""
+  local tty=""
+  local qemu=""
+  local msize=""
+  local paras=""
+
+  local vlan="0"
+
+  if [ ${RFS_GRAPHIC:-""} ] ; then
+    tty="tty1"
+    graphic=""
+    console=""
+  else
+    tty="ttyS0"
+    graphic="-nographic"
+    console="console=ttyS0"
+  fi
+
+
+  local tty_conf="${eventdir}$tty.conf"
+
+  qemu=$(arch_to_emu $arch)
+
+
+  # In QEMU?
+  local qemu_arg=""
+  for arg in $(cat /proc/cmdline) ; do 
+    case $arg in
+    qemu=*)
+      qemu_arg="${arg#qemu=}"
+    esac
+  done
+
+  if [ "$qemu_arg" = "" ] ; then
+    smp=2
+    apic=""
+  else
+    smp=1 # This is because qemu without hardware is only fast with a single CPU. 
+    apic="noapic"
+  fi
+
+  local hostbridge=""
+  if [ -e "$volume"netboot ] ; then
+    paras="-boot n"
+
+  else
+    if [ -e "$tty_conf" ] ; then
+      mv "$tty_conf" "$tty_conf.keep"
+    fi
+    sed "s:blabla:$command:" "${rfs_tools_d}/tty" | sed "s:ttyS0:$tty:g"  > "$tty_conf"
+
+    if [ $(find_a_bridge) ] ; then
+      hostbridge="bridged"
+    else 
+      hostbridge="user"
+    fi
+
+    local nfsroot_url=$(volume_get_url "$volume")
+    nfsroot="$(nfsurl_to_nfs $nfsroot_url)"
+
+    # Configure an eth for the NFS root.
+
+    paras="$(get_netopts_p $hostbridge $vlan "$volume")"
+    paras="$paras -kernel ${volume}vmlinuz -initrd ${volume}initrd.img -append \"$console boot=nfs ip=:::::eth$vlan:dhcp nfsroot=$nfsroot,udp,nolock $apic rw qemu=1\" "
+
+    let vlan=$vlan+1
+  fi
+
+  # Configure eth1.
+  if [ "$net" ] && [ $net != "$hostbridge" ] ; then
+    paras="$paras $(get_netopts_p $net $vlan "$volume")"
+    let vlan=$vlan+1
+  fi
+
+  msize=$(($(memtotal)/2048))
+  if [ $msize -gt 1024 ] ; then
+    msize=1024
+  fi
+
+  eval "$qemu -smp $smp -m $msize -hda /dev/zero $graphic $paras" # quiet
+
+  if [ ${tap+x} ] ; then
+    tunctl -d $tap
+    rm -f /tmp/$tap
+  fi
+
+  rm -f "$tty_conf"
+  [ -e "$tty_conf.keep" ] && mv "$tty_conf.keep" "$tty_conf"
+
+  return 0
+}
+
+
+startStopDaemon_fake() {
+  local volume=${1%/}/ ; shift
+
+  local exe=$volume/sbin/start-stop-daemon
+
+  if [ -x "$exe" ] ; then
+    mv "$exe" "$exe.REAL"
+
+    echo \
+      "#!/bin/sh
+      echo
+      echo \"Warning: Fake start-stop-daemon called, doing nothing\"" > "$exe"
+    chmod 755 "$exe"
+  fi
+}
+
+startStopDaemon_real() {
+  local volume=${1%/}/ ; shift
+
+  local exe=$volume/sbin/start-stop-daemon
+
+  if [ -x "$exe.REAL" ] ; then
+    mv "$exe.REAL" "$exe" 
+  fi
+}
+
+
+initctl_fake() {
+  local volume=${1%/}/ ; shift
+
+  local exe=$volume/sbin/initctl
+
+  if [ -x "$exe" ] ; then
+    mv "$exe" "$exe.REAL"
+
+    echo \
+      "#!/bin/sh
+      echo
+      echo \"Warning: Fake initctl called, doing nothing\"" > "$exe"
+    chmod 755 "$exe"
+  fi
+}
+
+initctl_real() {
+  local volume=${1%/}/ ; shift
+
+  local exe=$volume/sbin/initctl
+
+  if [ -x "$exe.REAL" ] ; then
+    mv "$exe.REAL" "$exe" 
+  fi
+}
+
+domainname_fake() {
+  local volume=${1%/}/ ; shift
+
+  local exe=$volume/bin/domainname
+  if [ -x "$exe" ] ; then
+    mv "$exe" "$exe.REAL"
+
+    echo \
+      "#!/bin/sh
+      cat /etc/defaultdomain" > "$exe"
+    chmod 755 "$exe"
+  fi
+}
+
+domainname_real() {
+  local volume=${1%/}/ ; shift
+
+  local exe=$volume/bin/domainname
+
+  if [ -x "$exe.REAL" ] ; then
+    mv "$exe.REAL" "$exe" 
+  fi
+}
+
+hostname_fake() {
+  local volume=${1%/}/ ; shift
+
+  local exe=$volume/bin/hostname
+  if [ -x "$exe" ] ; then
+    mv "$exe" "$exe.REAL"
+
+    echo \
+      "#!/bin/sh
+      cat /etc/hostname" > "$exe"
+    chmod 755 "$exe"
+  fi
+}
+
+hostname_real() {
+  local volume=${1%/}/ ; shift
+
+  local exe=$volume/bin/hostname
+
+  if [ -x "$exe.REAL" ] ; then
+    mv "$exe.REAL" "$exe" 
+  fi
+}
+
+RFS_ROOT_FILE=/tmp/rfs_tools_root
+
+rfs_execute_chroot() {
+  local volume=${1%/}/ ; shift
+  local command=$1     ; shift
+
+  # Make the hosts network available.
+  local resolv="/etc/resolv.conf"
+  resolv="$(chroot $volume readlink -m $resolv)"
+  resolv="$volume${resolv}"
+  cp /etc/resolv.conf "$resolv"
+
+
+  mount -o bind /sys      "${volume}sys/"
+  mount -o bind /dev      "${volume}dev/"
+  mount -o bind /dev/pts  "${volume}dev/pts"
+  mount -o bind /proc     "${volume}proc/"
+  mount -o bind /proc/sys/fs/binfmt_misc "${volume}proc/sys/fs/binfmt_misc"
+
+  local policy="${volume}usr/sbin/policy-rc.d"
+  echo -e '#!/bin/sh -uex\nexit 101' > $policy
+  chmod a+x $policy
+
+  # Unfortunately "policy-rc.d" is not working in with upstart.
+  # See https://bugs.launchpad.net/ubuntu/+source/live-helper/+bug/523688
+  # Workaround:
+  startStopDaemon_fake $volume
+  initctl_fake         $volume
+  domainname_fake      $volume
+  hostname_fake        $volume
+
+  echo $volume > $volume$RFS_ROOT_FILE
+  set +e
+  /usr/sbin/chroot "$volume" $command $@
+  local result=$?
+  set -e
+  rm $volume$RFS_ROOT_FILE
+
+  hostname_real        $volume
+  domainname_real      $volume
+  initctl_real         $volume
+  startStopDaemon_real $volume
+  rm $policy
+
+  local proc="${volume}proc/"
+  local proc_c="${volume}proc/mounts"
+  local binf="${volume}proc/sys/fs/binfmt_misc/"
+  local binf_c="${volume}proc/sys/fs/binfmt_misc/status"
+
+#  while [ -e "${proc_c}" -o -e "${binf_c}" ] ; do
+#    while [ -e "${binf_c}" ] ; do
+#      echo "umounting binfmt_misc" >&2
+#      umount "${binf}"
+#    done
+
+#    while [ -e "${proc_c}" ] ; do
+#      echo "umounting proc" >&2
+#      umount "${proc}"
+#    done
+#  done
+
+  umount "${binf}" "${proc}" "${volume}dev/pts" "${volume}dev/" "${volume}sys/"
+
+  return $result
+}
+
+rfs_get_root() {
+  if [ -f $RFS_ROOT_FILE ] ; then
+    cat $RFS_ROOT_FILE
+  else
+    echo ""
+  fi
+}
+
+
+#
+# Invoke a particular command in an RFS on the CLI.
+#
+# Usage:
+#  rfs_execute <name> <archi> <command> <net> <chroot>
+#
+rfs_execute() {
+  local  volume=${1%/}/ ; shift
+  local    arch=$1      ; shift
+  local     net=$1      ; shift
+  local  chroot=$1      ; shift
+  local command=$1      ; shift
+
+  if [ "$chroot" ] ; then
+    # FIXME: Need to check host arch is target arch compatible.
+    rfs_execute_chroot $volume $command $@
+  else
+    rm -f "$volume/etc/udev/rules.d/70-persistent-net.rules"
+    rfs_execute_vm $volume $arch "$net" $command $@
+    rm -f "$volume/etc/udev/rules.d/70-persistent-net.rules"
+  fi
+}
+
+rfs_create() {
+  local volume=${1%/}/ ; shift
+  local target=$1      ; shift
+
+  local basis="${target%%-*}"
+  local suite=""
+  [ "$basis" != "$target" ] && suite="${target##*-}"
+
+  local arch=$1 ; shift
+
+  shlib_load_with_path "$(get_plgpath)" rfs_create_$basis
+
+  rfs_create_${basis} "$volume" "$suite" "$arch"
+}
+
+#
+# Enter a particular RFS.
+#
+# usage:
+#  <name>    # name of the RFS (see rfs list)
+#  <arch>    # Architecture.
+#
+rfs_enter() {
+  local volume=${1%/}/ ; shift
+  local   arch=$1      ; shift
+  local    net=$1      ; shift
+  local chroot=$1      ; shift
+
+  if [ "$chroot" ] ; then
+    rfs_execute $volume $arch "$net" "chroot" su -
+  else
+    rfs_execute $volume $arch "$net" "" /bin/bash 
+  fi
+}
+
+
+rfs_upgrade() {
+  local volume=${1%/}/ ; shift
+  local   arch=$1      ; shift
+  local    net=$1      ; shift
+  local chroot=$1      ; shift
+
+  local script=$(mktemp -p /tmp)
+  echo "#!/bin/bash"                          >  $script
+  echo "sleep 5"                              >> $script 
+  echo "apt-get update       -y --force-yes"  >> $script 
+  echo "apt-get dist-upgrade -y --force-yes"  >> $script 
+
+  chmod u+x $script
+  rfs_cp    $script $volume  /root
+  rm        $script
+
+  rfs_execute $volume $arch "$net" "$chroot" /root/$(basename $script)
+}

@@ -1,0 +1,7 @@
+Section: tools
+Priority: extra
+Maintainer: Kay Ramme <kay.ramme@gmail.com>
+Homepage: http://bazult.de
+Architecture: all
+Depends: bootnetd,qemu,kvm,uml-utilities,rsync,b-nfs-server,apt-tools
+Description: Root File System Tools

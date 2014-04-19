@@ -1,0 +1,53 @@
+#!/bin/bash -eux
+
+rootdir="$(readlink -f $(dirname $0))"
+shl="$rootdir/shlib.shl"
+. "$shl"
+
+
+shlib_load "rfs-tools"
+
+
+#
+# RFS Tools frontend.
+#
+
+cmd=$1 ; shift
+args=""
+for arg in "$@" ; do
+  args="$args \"$arg\""
+done
+
+case "$cmd" in
+"install")
+  eval rfs_install $args
+  ;;
+
+"remove")
+  eval rfs_remove $args
+  ;;
+
+"cp"     )
+  eval rfs_cp      $args
+  ;;
+
+"execute")
+  eval  rfs_execute $args
+  ;;
+
+"create" )
+  eval  rfs_create  $args
+  ;;
+
+"enter" )
+  eval  rfs_enter   $args
+  ;;
+
+"upgrade")
+  eval  rfs_upgrade $args
+  ;;
+
+ *)
+ echo "available commands: install, cp, execute, clone, create, enter, export, list, upgrade"
+ ;;
+esac

@@ -1,0 +1,11 @@
+deb http://security.ubuntu.com/ubuntu/  suite-security universe main multiverse restricted
+deb http://archive.ubuntu.com/ubuntu suite-updates universe main multiverse restricted
+deb http://archive.ubuntu.com/ubuntu suite-proposed universe main multiverse restricted
+deb http://archive.ubuntu.com/ubuntu suite-backports universe main multiverse restricted
+deb http://archive.ubuntu.com/ubuntu suite main universe restricted multiverse
+
+#deb http://security.ubuntu.com/ubuntu/ suite-security universe main multiverse restricted
+#deb http://de.archive.ubuntu.com/ubuntu suite-updates universe main multiverse restricted
+#deb http://de.archive.ubuntu.com/ubuntu suite-proposed universe main multiverse restricted
+#deb http://de.archive.ubuntu.com/ubuntu suite-backports universe main multiverse restricted
+#deb http://de.archive.ubuntu.com/ubuntu suite main universe restricted multiverse

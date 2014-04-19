@@ -1,0 +1,66 @@
+#!/bin/bash
+
+shlib_load "bootnet"
+
+
+# AUTOFS stuff
+autofs_add() {
+  local path="$1" ;  shift
+  local prog="$1" ;  shift
+  local file=${1-/etc/auto.master}
+
+  invoke-rc.d autofs stop
+  conffile_add_item $file "$path"  "$prog"
+  invoke-rc.d autofs start
+}
+
+autofs_rem() {
+  local path="$1" ;  shift
+  local file=${1-/etc/auto.master}
+
+  invoke-rc.d autofs stop
+  conffile_rem_item $file "$path"
+  invoke-rc.d autofs start
+}
+
+
+autofs_enable_snet() {
+  autofs_add "/net" "/etc/auto.net"
+}
+
+autofs_disable_snet() {
+  autofs_rem "/net"
+}
+
+
+
+# Configure network maps.
+autofs_enable_network() {
+  local type=$1
+
+  # Add proper automount option to nsswitch.conf.
+  # FIXME: Need to check if added already (refcounted).
+  echo "automount: $type" >> /etc/nsswitch.conf
+
+  invoke-rc.d autofs restart
+}
+
+# De-Configure network maps.
+autofs_disable_network() {
+  local type=$1
+
+  #FIXME: Needs to be dynamic :-)
+  grep -v "automount: $type" /etc/nsswitch.conf > /etc/nsswitch.conf.tmp
+  mv /etc/nsswitch.conf.tmp /etc/nsswitch.conf
+}
+
+
+autofs_ensure() {
+  apt-get install -y --force-yes autofs
+
+  sed 's:start-stop-daemon --start:mkdir -p "$mnt"\nstart-stop-daemon --start:g' /etc/init.d/autofs > /etc/init.d/autofs.new
+  mv /etc/init.d/autofs.new /etc/init.d/autofs
+  chmod a+x /etc/init.d/autofs
+
+  autofs_enable_snet
+}

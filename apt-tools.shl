@@ -1,0 +1,376 @@
+#!/bin/bash
+
+shlib_load "bootnet"
+
+
+# TODO: Separate repository management from installation.
+if [ ${USER=root} = root ] ; then
+  xuser=$(eval echo ~${SUDO_USER=root})
+
+else
+  xuser=$(eval echo ~$USER)
+fi
+
+APTREPO_D=$xuser/.bnt/repo/
+
+
+aptdscp_get_stem() {
+  local aptdscp_f=$1 ; shift
+
+  local stem=$(grep ^stem: $aptdscp_f)
+  stem=${stem#*: }
+
+  echo $stem
+}
+
+aptdscp_get_url() {
+  local aptdscp_f=$1 ; shift
+
+  local url=$(grep ^url: $aptdscp_f)
+  url=${url#*: }
+
+  echo $url
+}
+
+aptdscp_get_branch() {
+  local aptdscp_f=$1 ; shift
+
+  local branch=$(grep ^branch: $aptdscp_f)
+  branch=${branch#*: }
+
+  echo $branch
+}
+
+aptdscp_get_cmps() {
+  local aptdscp_f=$1 ; shift
+
+  local cmps=$(grep ^components: $aptdscp_f)
+  cmps=${cmps#*: }
+
+  echo $cmps
+}
+
+aptdscp_get_key() {
+  local aptdscp_f=$1 ; shift
+
+  local key=$(grep ^key: $aptdscp_f)
+  key=${key#*: }
+
+  echo $key
+}
+
+apt_install_pkgs() {
+  local packages=$*
+
+  export DEBIAN_FRONTEND=noninteractive
+
+  # Install all packages at once.
+  apt-get install    -y --force-yes $packages
+
+  apt-get clean      -y --force-yes
+  apt-get autoclean  -y --force-yes
+  apt-get autoremove -y --force-yes
+}
+
+apt_remove_pkgs() {
+  local packages=$*
+
+  export DEBIAN_FRONTEND=noninteractive
+
+  # Install all packages at once.
+  apt-get purge      -y --force-yes $packages
+
+  apt-get clean      -y --force-yes
+  apt-get autoclean  -y --force-yes
+  apt-get autoremove -y --force-yes
+}
+
+apt_add_key() {
+  local file="$1" ; shift
+
+  apt-key add "$file"
+}
+
+apt_add_key_from_url() {
+  local url="$1" ; shift
+
+#  wget -q "$url" -O- | apt-key add -
+  wget  "$url" /tmp/gggg
+  apt-key add /tmp/gggg
+}
+
+apt_add_repo() {
+  local    url=$1 ; shift
+  local   stem=$1 ; shift
+  local branch=$1 ; shift
+  local   cmps=$1 ; shift
+  local    key=$1 ; shift
+
+  # If not yet added, than ...
+#  if ! [ -f "/etc/apt/sources.list.d/$repo.list" ] ; then
+    # Shortcut.
+    [ "$(find_default_ip)" = "$(url_get_host $url)" ] && url="file://$(url_get_path $url)"
+
+    url=$(nfsurl_to_snet $url)
+    # ... add this repository.
+    echo "deb $url $stem-$branch $cmps" > "/etc/apt/sources.list.d/$stem-$branch.list"
+
+    if [ -n "$key" ] ; then
+      local keyfile=$(mktemp -p /tmp)
+      echo "$key" | base64 -d > $keyfile
+      apt_add_key  $keyfile
+      rm "$keyfile"
+    fi
+
+    if [ ${url:0:6} == "ssh://" ] ; then
+      # Don't do host key checking for the site, the repository is key protected
+      # anyway. And this would abandon host replacement.
+      # FIXME: This needs to be more generic.
+      echo >> /etc/ssh/ssh_config
+      echo "host bazult.de"               >> /etc/ssh/ssh_config
+      echo "    StrictHostKeyChecking no" >> /etc/ssh/ssh_config
+    fi
+
+    apt-get update
+#  fi
+}
+
+apt_add_repo_from_dscp() {
+  local aptdscp_f=$1 ; shift
+
+  local    url=$(aptdscp_get_url    $aptdscp_f)
+  local   stem=$(aptdscp_get_stem   $aptdscp_f)
+  local branch=$(aptdscp_get_branch $aptdscp_f)
+  local   cmps=$(aptdscp_get_cmps   $aptdscp_f)
+  local    key=$(aptdscp_get_key    $aptdscp_f)
+
+  apt_add_repo $url $stem $branch $cmps "$key"
+}
+
+_write_distro_file() {
+  local   site=$1 ; shift
+  local   stem=$1 ; shift
+  local branch=$1 ; shift
+  local   cmps=$1 ; shift
+  local   file=$1 ; shift
+
+  mkdir -p $(dirname $file)
+
+  echo -e -n \
+"Origin:        $site\n"\
+"Label:         $stem\n"\
+"Codename:      $stem-$branch\n"\
+"Architectures: i386 amd64 any\n"\
+"Components:    $cmps\n"\
+"Description:   bootnet apt repository\n"\
+"SignWith:      yes\n"\
+> $file
+}
+
+_aggregate_distro_files() {
+  local dir=$APTREPO_D/distros/
+
+  local distris=$APTREPO_D"conf/distributions"
+
+  rm -f $distris
+  mkdir -p "$(dirname $distris)"
+  touch "$distris"
+  for file in $dir/*.dist ; do
+    cat $file >> $distris
+    echo >> $distris
+  done
+}
+
+_write_dscp_file() {
+  local    url=$1 ; shift
+  local   stem=$1 ; shift
+  local branch=$1 ; shift
+  local   cmps=$1 ; shift
+  local    key=$1 ; shift
+  local   file=$1 ; shift
+
+  mkdir -p $(dirname $file)
+
+  echo "url:        $url"    >  $file 
+  echo "stem:       $stem"   >> $file 
+  echo "branch:     $branch" >> $file 
+  echo "components: $cmps"   >> $file 
+  echo "key:        $key"    >> $file 
+}
+
+aptrepo_add_distro() {
+  local   site=$1 ; shift
+  local   stem=$1 ; shift
+  local branch=$1 ; shift
+  local   cmps=$1 ; shift
+
+  local dist_f=$APTREPO_D/distros/$stem-$branch.dist
+  _write_distro_file $site $stem $branch $cmps $dist_f
+
+  local key=$(gpg --export | base64 -w 0)
+  [ ! $key ] && return 1  # Abort on no key.
+  local url
+  # FIXME: This needs to be somewhat more generic. ;-)
+  if [ $(/usr/bin/whoami) == "gitbox" ] ; then
+    echo "*********** REPO URL IS BAZULT."
+    url="ssh://gitbox@bazult.de:/home/gitbox/.bnt/repo"
+  else
+    url="$(volume_get_url $APTREPO_D)"
+  fi
+
+  local dscp_f=$APTREPO_D/distros/$stem-$branch.dscp
+  _write_dscp_file $url $stem $branch $cmps $key $dscp_f
+
+  _aggregate_distro_files
+}
+
+aptrepo_rem_distro() {
+  local   stem=$1 ; shift
+  local branch=$1 ; shift
+
+  local dist_f=$APTREPO_D/distros/$stem-$branch.dist
+  local dscp_f=$APTREPO_D/distros/$stem-$branch.dscp
+
+  rm $dist_f $dscp_f
+
+  aggregate_distro_files
+}
+
+aptrepo_add_pkg() {
+  local    stem=$1 ; shift
+  local  branch=$1 ; shift
+  local package=$1 ; shift
+
+  local ext=${package##*.}
+  local repcmd="include$ext"
+
+  reprepro -b $APTREPO_D -S admin -P extra $repcmd $stem-$branch $package #&> /dev/null 
+}
+
+aptrepo_rem_pkg() {
+  local    stem=$1 ; shift
+  local  branch=$1 ; shift
+  local package=$1 ; shift
+
+  reprepro -b $APTREPO_D remove $stem-$branch $package &> /dev/null || true
+}
+
+aptrepo_create_pkg() {
+  local  src_d=$1 ; shift
+  local   stem=$1 ; shift
+  local branch=$1 ; shift
+
+  local src_cntrl_f="$src_d/control"
+
+  [ ! -f $src_cntrl_f ] && echo "control file $src_cntrl_f not found in package" && return 1
+
+  # Derive the packages name.
+  local pkgname=$(basename $src_d)
+
+  # Grep the packages version, if defined.
+  local version=""
+  if version=$(grep ^Version: $src_cntrl_f) ; then
+    ver=1
+    version=${version#*: }
+
+  else
+    local versions_d="$APTREPO_D/versions/"
+    local version_f=$versions_d$pkgname-$branch.version
+
+    mkdir -p "$versions_d"
+
+    if ! [ -e "$version_f" ] ; then
+      version=0
+    else
+      version=$(cat "$version_f")
+    fi
+
+    let version=version+1
+    echo $version > "$version_f"
+  fi
+
+
+  # Create DEBIAN dir.
+  local target_d=$(mktemp -d)/
+
+  local deb_d=$target_d$"DEBIAN/"
+  mkdir -p $deb_d
+
+  # Copy control files to the DEBIAN dir.
+  if [ -x $src_d/preinst ]; then
+    cp -a $src_d/preinst $deb_d
+    chmod 775 "$deb_d"preinst
+  fi
+
+  if [ -x $src_d/postinst ]; then
+    cp -a $src_d/postinst $deb_d
+    chmod 775 "$deb_d"postinst
+  fi
+
+  if [ -x $src_d/prerm ]; then
+    cp -a $src_d/prerm $deb_d
+    chmod 775 "$deb_d"prerm
+  fi
+
+  if [ -x $src_d/postrm ]; then
+    cp -a $src_d/postrm $deb_d
+    chmod 775 "$deb_d"postrm
+  fi
+
+  if [ -x $src_d/config ]; then
+    cp -a $src_d/config $deb_d
+    chmod 775 "$deb_d"config
+  fi
+
+  if [ -f $src_d/templates ]; then
+    cp -a $src_d/templates $deb_d
+  fi
+
+  # Grep the packages repository file, if defined.
+  local aptrepo_f
+  aptrepo_f=$(grep ^Repository: $src_cntrl_f) && aptrepo_f=$target_d${aptrepo_f#*: }
+
+  # Remove "Repository:" entry while copying control.
+  tgt_cntrl_f=$deb_d/control
+  grep -v Repository $src_cntrl_f > $tgt_cntrl_f
+
+  # Add "Version:" entry, if not defined.
+#  ! [ ${ver+x} ] && echo "Version: ${branch//-/_}_$version" >> $tgt_cntrl_f
+  ! [ ${ver+x} ] && echo "Version: 1${branch}$version" >> $tgt_cntrl_f
+
+  # Add the package name.
+  echo "Package: $pkgname" >> $tgt_cntrl_f
+
+  # Copy the files ...
+  rsync -a $src_d/ $target_d
+
+  # ... and remove the control files.
+  rm -f $target_d/preinst $target_d/postinst $target_d/prerm $target_d/postrm $target_d/control $target_d/config $target_d/templates
+
+  # ... remove any ".gitignore" files.
+  find $target_d -name ".gitignore" -delete
+
+  # Create the "repo" file, if requested.
+  if [ ${aptrepo_f} ] ; then
+    mkdir -p $(dirname $aptrepo_f)
+
+    cp $APTREPO_D/distros/$stem-$branch.dscp $aptrepo_f
+  fi
+
+  # And finally create the package.
+  dpkg -b  ${target_d} &> /dev/null
+  rm   -rf ${target_d} &> /dev/null
+
+  echo ${target_d%/}.deb
+}
+
+aptrepo_add_source() {
+  local  src_d=$1 ; shift
+  local   stem=$1 ; shift
+  local branch=$1 ; shift
+
+  local pkg_f=$(aptrepo_create_pkg $src_d $stem $branch)
+
+  aptrepo_add_pkg $stem $branch $pkg_f
+  rm $pkg_f
+}

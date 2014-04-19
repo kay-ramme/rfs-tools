@@ -1,0 +1,58 @@
+#!/bin/bash
+
+shlib_load "bootnet" "rfs-tools"
+
+# Plan:
+# Always creates a new RFS or updates an already existing RFS.
+#
+
+rfs_create_ubuntu() {
+  local repodscp=$(dirname $rfs_create_ubuntu_shl)/theRepo
+  if ! [ -f $repodscp ] ; then
+    shlib_load "apt-tools"
+    # FIXME:
+    # This gives an error in ("fatal, not a git repository")
+    # if the working dir does not belong to the git repo.
+    branch=$(git branch| grep '^*'|sed 's/\* //g')
+    repodscp=$APTREPO_D/distros/bootbox-$branch.dscp
+  fi
+
+  local  volume=$1 ; shift
+  local   suite=$1 ; shift
+  local    arch=$1 ; shift
+
+  local keep_rfs_graphic=${RFS_GRAPHIC-""}
+  RFS_GRAPHIC=""
+
+  # Map arch to deb arch names.
+  local debarch=$(/usr/bin/awk -v arch=$arch '!/^#/ { if ( arch ~ $3 ) { print $1 ; exit } }' /usr/share/dpkg/cputable)
+
+  # Bootstrap initial RFS, ca. 110MB.
+  # FIXME: Only install ssh if needed!
+  export LC_ALL=C # Workaround: "perl: warning: Setting locale failed."
+  /usr/sbin/debootstrap --arch=$debarch --variant=minbase --include "gpgv gnupg openssh-client" "$suite" "$volume"
+
+  # Enable all standard repositories. 
+  # TODO: Find a better way for doing so!
+  #  key: software-properties-gtk
+  sed s/suite/$suite/g "$(dirname $rfs_create_ubuntu_shl)/"sources.list > "$volume"etc/apt/sources.list
+  # FIXME: Need to trigger an apt-get update here.
+
+  # Configure "loopback" device.
+  mkdir -p "$volume"etc/network/
+  echo -e "auto lo\niface lo inet loopback" >> "$volume"etc/network/interfaces
+  echo "127.0.0.1	localhost"                >  "$volume"etc/hosts
+
+  # Install the "pxe-client" package.
+#  rfs_install "$volume" $arch "" chroot $repodscp/shlib
+#  rfs_install "$volume" $arch "" chroot $repodscp/pxe-client
+
+  rfs_install "$volume" $arch "" chroot ubuntu-standard
+#  rfs_install "$volume" $arch "" chroot ubuntu-desktop
+
+  # Problem with .local domains and mDNS, see: https://bugs.launchpad.net/ubuntu/+bug/140663
+  sed 's/\[NOTFOUND=return\]//g' "$volume"etc/nsswitch.conf   > "$volume"etc/nsswitch.conf.new
+  mv                             "$volume"etc/nsswitch.conf.new "$volume"etc/nsswitch.conf
+
+  rm -f "${volume}etc/hostname"
+}

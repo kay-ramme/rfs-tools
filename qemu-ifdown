@@ -1,0 +1,21 @@
+#!/bin/bash -eu
+
+rootdir="$(readlink -f $(dirname $0)/../../../../)"
+shl="/usr/share/bootnet/libs/shlib.shl"
+if [ -f "$rootdir/shlib/$shl" ] ; then
+. "$rootdir/shlib/$shl"
+else
+. "$shl"
+fi
+
+shlib_load "bootnet"
+
+tap=$1
+
+/sbin/ip link set $tap down
+/sbin/ifconfig $tap down
+
+nic=$(find_a_bridge)
+
+/usr/sbin/brctl delif $nic $tap
+
